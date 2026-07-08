@@ -1,6 +1,6 @@
 import express from 'express';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const app = express();
@@ -19,7 +19,7 @@ const mcpServer = new Server(
   }
 );
 
-// 2. Registrar la herramienta de imágenes para que Claude la vea
+// 2. Registrar la herramienta de imágenes para Claude
 mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
@@ -47,7 +47,7 @@ mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-// 3. Ejecutar la lógica de la llamada cuando Claude use la herramienta
+// 3. Ejecutar la lógica de generación cuando Claude invoque la herramienta
 mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (request.params.name !== "generar_imagen_gemini") {
     throw new Error("Herramienta no encontrada");
@@ -58,13 +58,12 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (!apiKey) {
     return {
-      content: [{ type: "text", text: "Error: La variable de entorno GEMINI_API_KEY no está configurada en el servidor." }],
+      content: [{ type: "text", text: "Error: La variable de entorno GEMINI_API_KEY no está configurada." }],
       isError: true,
     };
   }
 
   try {
-    // Llamada directa HTTP sin SDK complejos para evitar fallos en entornos serverless
     const url = `https://googleapis.com{apiKey}`;
     
     const response = await fetch(url, {
@@ -80,24 +79,16 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (!response.ok) {
       const errorData = await response.json();
-      throw new Error(errorData.error?.message || "Error desconocido en la API de Google");
+      throw new Error(errorData.error?.message || "Error en la API de Google");
     }
 
     const data = await response.json();
-    const base64Image = data.generatedImages[0].image.imageBytes;
+    const base64Image = data.generatedImages.image.imageBytes;
 
-    // Retornamos la imagen en el formato nativo estructurado que Claude entiende
     return {
       content: [
-        {
-          type: "text",
-          text: `Imagen generada con éxito para el prompt: "${prompt}"`
-        },
-        {
-          type: "image",
-          data: base64Image,
-          mimeType: "image/jpeg"
-        }
+        { type: "text", text: `Imagen generada con éxito para el prompt: "${prompt}"` },
+        { type: "image", data: base64Image, mimeType: "image/jpeg" }
       ],
     };
 
@@ -109,25 +100,30 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// 4. Configurar las rutas HTTP/SSE indispensables que Claude.ai web consumirá
-let sseTransport = null;
+// 4. NUEVO ENDPOINT: Ruta unificada Streamable HTTP compatible con Vercel Serverless
+app.all('/mcp', async (req, res) => {
+  // Manejo de la conexión bidireccional continua por HTTP chunked encoding
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Transfer-Encoding', 'chunked');
 
-app.get('/sse', (req, res) => {
-  sseTransport = new SSEServerTransport('/messages', res);
-  mcpServer.connect(sseTransport).catch(console.error);
+  const transport = {
+    async start() {
+      // Maneja la entrada de datos del cliente hacia el servidor MCP
+      req.on('data', (chunk) => this.onMessage?.(JSON.parse(chunk.toString())));
+    },
+    async send(message) {
+      // Devuelve la respuesta del servidor hacia Claude de inmediato
+      res.write(JSON.stringify(message) + '\n');
+    },
+    async close() {
+      res.end();
+    }
+  };
+
+  await mcpServer.connect(transport);
 });
 
-app.post('/messages', async (req, res) => {
-  if (sseTransport) {
-    await sseTransport.handleMessage(req, res);
-  } else {
-    res.status(400).send('No hay una conexión SSE activa');
-  }
-});
-
-// Iniciar en el puerto automático provisto por la nube (Vercel/Render)
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Servidor MCP HTTP/SSE corriendo en el puerto ${PORT}`);
+  console.log(`Servidor MCP corriendo en puerto ${PORT}`);
 });
-
